@@ -33,27 +33,69 @@
 #endif
 
 // -------------------- Hardware pins --------------------
-#define STEP_PIN 25
-#define DIR_PIN 26
-#define ENABLE_PIN 27
-#define HOME_SWITCH_PIN 33  // Reserved for a future origin switch.
+// X retains the original wiring. Y uses ordinary output-capable GPIOs that are
+// neither boot-strapping pins nor input-only pins on this ESP32-WROOM-32 board.
+// GPIO 18/19/23/5 remain free for a future VSPI SD-card interface. GPIO 21
+// remains available if a future I2C bus is needed; its clock can be reassigned
+// because GPIO 22 is used by Y ENABLE.
+#define X_STEP_PIN 25
+#define X_DIR_PIN 26
+#define X_ENABLE_PIN 27
+#define Y_STEP_PIN 16
+#define Y_DIR_PIN 17
+#define Y_ENABLE_PIN 22
+
+// One minimum/home switch is assigned to each axis. Wire each switch's normally
+// open (NO) contact between its GPIO and GND. Both pins have internal pull-ups,
+// so no external resistors or 3.3 V switch wiring are required. An unpressed
+// switch reads HIGH and a pressed switch reads LOW. Unlike NC wiring, a broken
+// wire cannot be detected and will look like an unpressed switch.
+#define X_LIMIT_PIN 32
+#define Y_LIMIT_PIN 13
+constexpr uint8_t LIMIT_TRIGGERED_LEVEL = LOW;
+
+// Bench calibration confirmed that LOW on each DIR pin must count upward so
+// negative coordinate motion travels toward the minimum/home switch. Change
+// these values only if the driver/motor wiring changes; never rewire energized
+// motor coils to correct coordinate direction.
+constexpr bool X_DIRECTION_HIGH_COUNTS_UP = false;
+constexpr bool Y_DIRECTION_HIGH_COUNTS_UP = false;
 
 // -------------------- Motor and web server state --------------------
 // The engine owns the ESP32 pulse peripherals. The pointer is null only if the
 // requested STEP pin/peripheral could not be allocated during setup.
 FastAccelStepperEngine stepperEngine;
-FastAccelStepper *stepper = nullptr;
 WebServer server(80);
 
 constexpr long DEFAULT_MOVE_STEPS = 200;
 constexpr float DEFAULT_MAX_SPEED = 1000.0F;
 constexpr float DEFAULT_ACCELERATION = 500.0F;
 
-// Settings are shared between HTTP handlers. They are changed only by the
-// Arduino application task, so no mutex is required.
-long requestedSteps = DEFAULT_MOVE_STEPS;
-float configuredMaxSpeed = DEFAULT_MAX_SPEED;
-float configuredAcceleration = DEFAULT_ACCELERATION;
+/** Runtime state and hardware assignment for one independently movable axis. */
+struct AxisState {
+  const char *name;
+  uint8_t stepPin;
+  uint8_t directionPin;
+  uint8_t enablePin;
+  uint8_t limitPin;
+  bool directionHighCountsUp;
+  FastAccelStepper *stepper;
+  long requestedSteps;
+  float configuredMaxSpeed;
+  float configuredAcceleration;
+  volatile bool limitEventPending;
+};
+
+// Settings are changed only by HTTP handlers on the Arduino application task.
+// Only limitEventPending is shared with an ISR and is therefore volatile.
+AxisState axisX = {"X", X_STEP_PIN, X_DIR_PIN, X_ENABLE_PIN, X_LIMIT_PIN,
+                   X_DIRECTION_HIGH_COUNTS_UP,
+                   nullptr, DEFAULT_MOVE_STEPS, DEFAULT_MAX_SPEED,
+                   DEFAULT_ACCELERATION, false};
+AxisState axisY = {"Y", Y_STEP_PIN, Y_DIR_PIN, Y_ENABLE_PIN, Y_LIMIT_PIN,
+                   Y_DIRECTION_HIGH_COUNTS_UP,
+                   nullptr, DEFAULT_MOVE_STEPS, DEFAULT_MAX_SPEED,
+                   DEFAULT_ACCELERATION, false};
 
 // The entire UI lives in flash, avoiding a filesystem dependency. Keep named
 // JavaScript functions expressed as arrow functions: Arduino's .ino preprocessor
@@ -72,7 +114,10 @@ const char INDEX_HTML[] PROGMEM = R"HTML(
     main { max-width: 560px; margin: auto; padding: 18px; }
     h1 { font-size: 1.55rem; margin: 6px 0 18px; }
     .card { background: #1f2937; border-radius: 16px; padding: 16px; margin-bottom: 14px; box-shadow: 0 5px 20px #0005; }
-    .position { text-align: center; font-size: 3rem; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
+    .axes { display: grid; gap: 14px; }
+    .axis-title { display: flex; align-items: center; justify-content: space-between; margin-bottom: 10px; }
+    .axis-title h2 { margin: 0; font-size: 1.3rem; }
+    .position { text-align: center; font-size: 2.5rem; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
     .label { color: #9ca3af; font-size: .85rem; text-align: center; }
     .buttons { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
     button { min-height: 64px; border: 0; border-radius: 13px; color: white; font-size: 1.15rem; font-weight: 700; touch-action: manipulation; }
@@ -80,43 +125,71 @@ const char INDEX_HTML[] PROGMEM = R"HTML(
     .move { background: #2563eb; }
     .stop { background: #dc2626; grid-column: 1 / -1; }
     .zero { background: #4b5563; width: 100%; margin-top: 12px; }
+    .all-stop { width: 100%; margin-bottom: 14px; background: #991b1b; }
+    .limit { border-radius: 999px; padding: 5px 9px; background: #065f46; font-size: .75rem; font-weight: 700; }
+    .limit.hit { background: #b91c1c; }
     .fields { display: grid; gap: 12px; }
     label { color: #d1d5db; font-size: .9rem; }
     input { box-sizing: border-box; width: 100%; min-height: 50px; margin-top: 5px; padding: 10px 12px; border: 1px solid #4b5563; border-radius: 10px; background: #111827; color: white; font-size: 1.05rem; }
     .save { width: 100%; margin-top: 14px; background: #059669; }
-    #state, #message { text-align: center; margin-top: 10px; color: #9ca3af; min-height: 1.2em; }
+    [id$="State"], #message { text-align: center; margin-top: 10px; color: #9ca3af; min-height: 1.2em; }
     #message.error { color: #fca5a5; }
   </style>
 </head>
 <body><main>
-  <h1>ESP32 Stepper Control</h1>
-  <section class="card">
+  <h1>ESP32 Two-Axis Control</h1>
+  <button class="all-stop" id="stopAll">STOP BOTH AXES</button>
+  <div class="axes">
+  <section class="card" data-axis="x">
+    <div class="axis-title"><h2>X Axis</h2><span id="xLimit" class="limit">LIMIT --</span></div>
     <div class="label">CURRENT POSITION (STEPS)</div>
-    <div id="position" class="position">--</div>
-    <div id="state">Connecting...</div>
-  </section>
-  <section class="card">
+    <div id="xPosition" class="position">--</div>
+    <div id="xState">Connecting...</div>
     <div class="buttons">
-      <button class="move" id="left">&#9664; LEFT</button>
-      <button class="move" id="right">RIGHT &#9654;</button>
-      <button class="stop" id="stop">STOP</button>
+      <button class="move" id="xNegative">X-</button>
+      <button class="move" id="xPositive">X+</button>
+      <button class="stop" id="xStop">STOP X</button>
     </div>
-    <button class="zero" id="zero">Zero Position</button>
-    <div id="message"></div>
+    <button class="zero" id="xZero">Zero X Position</button>
+    <div class="fields">
+      <label>Move distance (steps)<input id="xSteps" type="number" min="1" step="1" value="200"></label>
+      <label>Max speed (steps/sec)<input id="xSpeed" type="number" min="1" step="1" value="1000"></label>
+      <label>Acceleration (steps/sec&sup2;)<input id="xAccel" type="number" min="1" step="1" value="500"></label>
+      <button class="save" id="xSave">Apply X Settings</button>
+    </div>
   </section>
-  <section class="card fields">
-    <label>Move distance (steps)<input id="steps" type="number" min="1" step="1" value="200"></label>
-    <label>Max speed (steps/sec)<input id="speed" type="number" min="1" step="1" value="1000"></label>
-    <label>Acceleration (steps/sec&sup2;)<input id="accel" type="number" min="1" step="1" value="500"></label>
-    <button class="save" id="save">Apply Settings</button>
+  <section class="card" data-axis="y">
+    <div class="axis-title"><h2>Y Axis</h2><span id="yLimit" class="limit">LIMIT --</span></div>
+    <div class="label">CURRENT POSITION (STEPS)</div>
+    <div id="yPosition" class="position">--</div>
+    <div id="yState">Connecting...</div>
+    <div class="buttons">
+      <button class="move" id="yNegative">Y-</button>
+      <button class="move" id="yPositive">Y+</button>
+      <button class="stop" id="yStop">STOP Y</button>
+    </div>
+    <button class="zero" id="yZero">Zero Y Position</button>
+    <div class="fields">
+      <label>Move distance (steps)<input id="ySteps" type="number" min="1" step="1" value="200"></label>
+      <label>Max speed (steps/sec)<input id="ySpeed" type="number" min="1" step="1" value="1000"></label>
+      <label>Acceleration (steps/sec&sup2;)<input id="yAccel" type="number" min="1" step="1" value="500"></label>
+      <button class="save" id="ySave">Apply Y Settings</button>
+    </div>
   </section>
+  </div>
+  <div id="message"></div>
 </main>
 <script>
 const $ = id => document.getElementById(id);
-let firstStatus = true;
+const initialized = {x: false, y: false};
+let commandInFlight = false;
+let statusRequestInFlight = false;
 
 // POST form data to one API endpoint and surface firmware errors in the page.
 const post = async (path, values = {}) => {
+  // Status polling is paused while a command is in flight. This keeps the
+  // synchronous ESP32 WebServer queue clear for motion and STOP requests.
+  commandInFlight = true;
   const body = new URLSearchParams(values);
   try {
     const response = await fetch(path, {method: 'POST', headers: {'Content-Type': 'application/x-www-form-urlencoded'}, body});
@@ -128,42 +201,60 @@ const post = async (path, values = {}) => {
   } catch (error) {
     $('message').textContent = error.message;
     $('message').className = 'error';
+  } finally {
+    commandInFlight = false;
   }
 };
 
-const settings = () => {
-  return {steps: $('steps').value, maxSpeed: $('speed').value, acceleration: $('accel').value};
+const settings = axis => {
+  return {axis, steps: $(axis + 'Steps').value, maxSpeed: $(axis + 'Speed').value, acceleration: $(axis + 'Accel').value};
 };
 
 // These discrete click handlers can later become pointerdown/pointerup handlers
 // backed by /jog/start and /jog/stop without changing the existing move API.
-$('left').addEventListener('click', () => post('/move', {...settings(), direction: 'left'}));
-$('right').addEventListener('click', () => post('/move', {...settings(), direction: 'right'}));
-$('stop').addEventListener('click', () => post('/stop'));
-$('zero').addEventListener('click', () => post('/zero'));
-$('save').addEventListener('click', () => post('/settings', settings()));
+for (const axis of ['x', 'y']) {
+  $(axis + 'Negative').addEventListener('click', () => post('/move', {...settings(axis), direction: 'negative'}));
+  $(axis + 'Positive').addEventListener('click', () => post('/move', {...settings(axis), direction: 'positive'}));
+  $(axis + 'Stop').addEventListener('click', () => post('/stop', {axis}));
+  $(axis + 'Zero').addEventListener('click', () => post('/zero', {axis}));
+  $(axis + 'Save').addEventListener('click', () => post('/settings', settings(axis)));
+}
+$('stopAll').addEventListener('click', () => post('/stop', {axis: 'all'}));
 
 // Polling is intentionally independent of motion generation. MCPWM continues
 // producing stable pulses even when a network request is delayed.
 const updateStatus = async () => {
+  // setInterval can fire again before a slow fetch completes. Without this
+  // guard those requests accumulate and make button commands appear laggy.
+  if (commandInFlight || statusRequestInFlight) return;
+  statusRequestInFlight = true;
   try {
     const response = await fetch('/status', {cache: 'no-store'});
     if (!response.ok) throw new Error('Status unavailable');
     const data = await response.json();
-    $('position').textContent = data.currentPosition;
-    $('state').textContent = data.moving ? `Moving to ${data.targetPosition} (${data.distanceToGo} remaining)` : 'Stopped';
-    if (firstStatus) {
-      $('speed').value = data.maxSpeed;
-      $('accel').value = data.acceleration;
-      $('steps').value = data.requestedSteps;
-      firstStatus = false;
+    for (const axis of ['x', 'y']) {
+      const state = data[axis];
+      $(axis + 'Position').textContent = state.currentPosition;
+      $(axis + 'State').textContent = state.moving ? `Moving to ${state.targetPosition} (${state.distanceToGo} remaining)` : 'Stopped';
+      const limit = $(axis + 'Limit');
+      limit.textContent = state.limitTriggered ? 'LIMIT PRESSED' : 'LIMIT OK';
+      limit.className = state.limitTriggered ? 'limit hit' : 'limit';
+      if (!initialized[axis]) {
+        $(axis + 'Speed').value = state.maxSpeed;
+        $(axis + 'Accel').value = state.acceleration;
+        $(axis + 'Steps').value = state.requestedSteps;
+        initialized[axis] = true;
+      }
     }
   } catch (error) {
-    $('state').textContent = error.message;
+    $('xState').textContent = error.message;
+    $('yState').textContent = error.message;
+  } finally {
+    statusRequestInFlight = false;
   }
 };
 updateStatus();
-setInterval(updateStatus, 300);
+setInterval(updateStatus, 500);
 </script></body></html>
 )HTML";
 
@@ -196,167 +287,183 @@ bool parsePositiveFloat(const String &name, float &value) {
   return true;
 }
 
-/**
- * Validate and apply optional motion settings from the current HTTP request.
- *
- * FastAccelStepper accepts integer steps/s and steps/s^2. Web values are
- * rounded to those native units. When already moving, applySpeedAcceleration()
- * updates the queued ramp without coupling pulse timing to this HTTP handler.
- * Returns false after sending an HTTP error response.
- */
-bool applySettingsFromRequest(bool requireSteps) {
-  long newSteps = requestedSteps;
-  float newSpeed = configuredMaxSpeed;
-  float newAcceleration = configuredAcceleration;
+/** Resolve the required `axis=x|y` form argument to its runtime object. */
+AxisState *axisFromRequest() {
+  if (!server.hasArg("axis")) {
+    Serial.println("ERROR: axis argument missing");
+    sendJson(400, "{\"error\":\"Axis must be x or y\"}");
+    return nullptr;
+  }
+  const String requestedAxis = server.arg("axis");
+  if (requestedAxis == "x") return &axisX;
+  if (requestedAxis == "y") return &axisY;
+  Serial.printf("ERROR: unsupported axis '%s'\n", requestedAxis.c_str());
+  sendJson(400, "{\"error\":\"Axis must be x or y\"}");
+  return nullptr;
+}
+
+/** Validate and apply request settings to one hardware ramp generator. */
+bool applySettingsFromRequest(AxisState &axis, bool requireSteps) {
+  long newSteps = axis.requestedSteps;
+  float newSpeed = axis.configuredMaxSpeed;
+  float newAcceleration = axis.configuredAcceleration;
 
   if ((requireSteps || server.hasArg("steps")) && !parsePositiveLong("steps", newSteps)) {
-    Serial.println("ERROR: invalid move distance");
+    Serial.printf("ERROR: invalid %s move distance\n", axis.name);
     sendJson(400, "{\"error\":\"Move distance must be a positive integer\"}");
     return false;
   }
   if (server.hasArg("maxSpeed") && !parsePositiveFloat("maxSpeed", newSpeed)) {
-    Serial.println("ERROR: invalid max speed");
     sendJson(400, "{\"error\":\"Max speed must be positive\"}");
     return false;
   }
   if (server.hasArg("acceleration") && !parsePositiveFloat("acceleration", newAcceleration)) {
-    Serial.println("ERROR: invalid acceleration");
     sendJson(400, "{\"error\":\"Acceleration must be positive\"}");
     return false;
   }
-
-  // Validate before float-to-integer conversion; out-of-range conversion has
-  // undefined behavior in C++ and should never reach the motion library.
   if (newSpeed < 1.0F || newSpeed > static_cast<float>(INT32_MAX) ||
       newAcceleration < 1.0F || newAcceleration > static_cast<float>(INT32_MAX)) {
-    Serial.println("ERROR: speed or acceleration is outside integer range");
     sendJson(400, "{\"error\":\"Speed or acceleration is outside the supported range\"}");
     return false;
   }
+
   const uint32_t speedHz = static_cast<uint32_t>(lroundf(newSpeed));
   const int32_t acceleration = static_cast<int32_t>(lroundf(newAcceleration));
-
-  if (stepper != nullptr &&
-      (stepper->setSpeedInHz(speedHz) != 0 || stepper->setAcceleration(acceleration) != 0)) {
-    Serial.println("ERROR: speed or acceleration is outside FastAccelStepper limits");
+  if (axis.stepper != nullptr &&
+      (axis.stepper->setSpeedInHz(speedHz) != 0 ||
+       axis.stepper->setAcceleration(acceleration) != 0)) {
     sendJson(400, "{\"error\":\"Speed or acceleration is outside motor-controller limits\"}");
     return false;
   }
 
-  const bool motionSettingsChanged =
-      newSpeed != configuredMaxSpeed || newAcceleration != configuredAcceleration;
-  if (newSpeed != configuredMaxSpeed) {
-    configuredMaxSpeed = static_cast<float>(speedHz);
-    Serial.printf("Max speed changed to %.0f steps/sec\n", configuredMaxSpeed);
+  const bool changed = newSpeed != axis.configuredMaxSpeed ||
+                       newAcceleration != axis.configuredAcceleration;
+  axis.requestedSteps = newSteps;
+  axis.configuredMaxSpeed = static_cast<float>(speedHz);
+  axis.configuredAcceleration = static_cast<float>(acceleration);
+  if (changed && axis.stepper != nullptr && axis.stepper->isRunning() &&
+      !axis.stepper->isStopping()) {
+    axis.stepper->applySpeedAcceleration();
   }
-  if (newAcceleration != configuredAcceleration) {
-    configuredAcceleration = static_cast<float>(acceleration);
-    Serial.printf("Acceleration changed to %.0f steps/sec^2\n", configuredAcceleration);
-  }
-
-  if (stepper != nullptr) {
-    if (motionSettingsChanged && stepper->isRunning() && !stepper->isStopping()) {
-      stepper->applySpeedAcceleration();
-    }
-  }
-  requestedSteps = newSteps;
   return true;
 }
 
-/** GET /status: return the hardware engine's current motion state as JSON. */
+/** Serialize one axis using hardware position and its fail-safe limit input. */
+String axisStatusJson(const AxisState &axis) {
+  const int32_t current = axis.stepper->getCurrentPosition();
+  const int32_t target = axis.stepper->targetPos();
+  const bool limitTriggered = digitalRead(axis.limitPin) == LIMIT_TRIGGERED_LEVEL;
+  String json;
+  json.reserve(230);
+  json += "{\"currentPosition\":" + String(current);
+  json += ",\"targetPosition\":" + String(target);
+  json += ",\"distanceToGo\":" + String(target - current);
+  json += ",\"moving\":" + String(axis.stepper->isRunning() ? "true" : "false");
+  json += ",\"limitTriggered\":" + String(limitTriggered ? "true" : "false");
+  json += ",\"maxSpeed\":" + String(axis.configuredMaxSpeed, 2);
+  json += ",\"acceleration\":" + String(axis.configuredAcceleration, 2);
+  json += ",\"requestedSteps\":" + String(axis.requestedSteps) + "}";
+  return json;
+}
+
+/** GET /status: return both axes' motion and limit state as JSON. */
 void handleStatus() {
-  if (stepper == nullptr) {
-    sendJson(503, "{\"error\":\"Motor pulse engine is unavailable\"}");
+  if (axisX.stepper == nullptr || axisY.stepper == nullptr) {
+    sendJson(503, "{\"error\":\"One or more motor pulse engines are unavailable\"}");
     return;
   }
-  const int32_t currentPosition = stepper->getCurrentPosition();
-  const int32_t targetPosition = stepper->targetPos();
-  const int32_t distance = targetPosition - currentPosition;
-  const bool moving = stepper->isRunning();
-  String json;
-  json.reserve(220);
-  json += "{\"currentPosition\":" + String(currentPosition);
-  json += ",\"targetPosition\":" + String(targetPosition);
-  json += ",\"distanceToGo\":" + String(distance);
-  json += ",\"moving\":" + String(moving ? "true" : "false");
-  json += ",\"maxSpeed\":" + String(configuredMaxSpeed, 2);
-  json += ",\"acceleration\":" + String(configuredAcceleration, 2);
-  json += ",\"requestedSteps\":" + String(requestedSteps) + "}";
+  String json = "{\"x\":" + axisStatusJson(axisX);
+  json += ",\"y\":" + axisStatusJson(axisY) + "}";
   sendJson(200, json);
 }
 
-/**
- * POST /move: queue a signed relative move.
- * `right` is positive and `left` is negative. FastAccelStepper interprets move()
- * relative to the existing target, matching the original UI behavior.
- */
+/** POST /move: queue a positive or negative relative move on one axis. */
 void handleMove() {
-  if (stepper == nullptr) {
+  AxisState *axis = axisFromRequest();
+  if (axis == nullptr) return;
+  if (axis->stepper == nullptr) {
     sendJson(503, "{\"error\":\"Motor pulse engine is unavailable\"}");
     return;
   }
-  if (!applySettingsFromRequest(true)) return;
+  if (!applySettingsFromRequest(*axis, true)) return;
   if (!server.hasArg("direction")) {
-    Serial.println("ERROR: move direction missing");
-    sendJson(400, "{\"error\":\"Direction must be left or right\"}");
+    sendJson(400, "{\"error\":\"Direction must be positive or negative\"}");
     return;
   }
 
   const String direction = server.arg("direction");
   long signedSteps;
-  if (direction == "right") signedSteps = requestedSteps;
-  else if (direction == "left") signedSteps = -requestedSteps;
+  if (direction == "positive" || direction == "right") signedSteps = axis->requestedSteps;
+  else if (direction == "negative" || direction == "left") signedSteps = -axis->requestedSteps;
   else {
-    Serial.println("ERROR: invalid move direction");
-    sendJson(400, "{\"error\":\"Direction must be left or right\"}");
+    sendJson(400, "{\"error\":\"Direction must be positive or negative\"}");
     return;
   }
 
-  const int8_t result = stepper->move(static_cast<int32_t>(signedSteps));
+  // Each switch protects the negative/minimum end. Positive motion remains
+  // available to back off and close an opened limit-switch circuit.
+  if (signedSteps < 0 && digitalRead(axis->limitPin) == LIMIT_TRIGGERED_LEVEL) {
+    Serial.printf("ERROR: %s negative move blocked by active limit\n", axis->name);
+    sendJson(409, "{\"error\":\"Negative move blocked by active limit switch\"}");
+    return;
+  }
+
+  const int8_t result = axis->stepper->move(static_cast<int32_t>(signedSteps));
   if (result != MOVE_OK) {
-    Serial.printf("ERROR: FastAccelStepper rejected move with code %d\n", static_cast<int>(result));
+    Serial.printf("ERROR: %s move rejected with code %d\n", axis->name, result);
     sendJson(409, "{\"error\":\"Motor controller rejected the move\"}");
     return;
   }
-  Serial.printf("Move command: %s, requested steps: %ld, target: %ld\n",
-                direction.c_str(), requestedSteps, static_cast<long>(stepper->targetPos()));
+  Serial.printf("%s move: %s, steps: %ld, target: %ld\n", axis->name,
+                direction.c_str(), axis->requestedSteps,
+                static_cast<long>(axis->stepper->targetPos()));
   sendJson(200, "{\"message\":\"Move accepted\"}");
 }
 
-/** POST /stop: request a non-blocking, acceleration-limited controlled stop. */
+/** POST /stop: controlled-stop one selected axis or both axes. */
 void handleStop() {
-  if (stepper == nullptr) {
-    sendJson(503, "{\"error\":\"Motor pulse engine is unavailable\"}");
-    return;
+  const String requestedAxis = server.hasArg("axis") ? server.arg("axis") : "all";
+  if (requestedAxis == "all") {
+    if (axisX.stepper != nullptr) axisX.stepper->stopMove();
+    if (axisY.stepper != nullptr) axisY.stepper->stopMove();
+    Serial.println("STOP ALL command received");
+  } else {
+    AxisState *axis = axisFromRequest();
+    if (axis == nullptr) return;
+    if (axis->stepper == nullptr) {
+      sendJson(503, "{\"error\":\"Motor pulse engine is unavailable\"}");
+      return;
+    }
+    axis->stepper->stopMove();
+    Serial.printf("STOP %s command received\n", axis->name);
   }
-  // FastAccelStepper's hardware-backed queue performs a controlled deceleration.
-  stepper->stopMove();
-  Serial.println("STOP command received (controlled deceleration)");
   sendJson(200, "{\"message\":\"Stopping\"}");
 }
 
-/** POST /zero: redefine commanded position as zero, but only at standstill. */
+/** POST /zero: redefine one axis position as zero only at standstill. */
 void handleZero() {
-  // Re-zeroing during motion would redefine coordinates while moving, so reject
-  // it. STOP first and wait for the status to report stopped.
-  if (stepper == nullptr) {
+  AxisState *axis = axisFromRequest();
+  if (axis == nullptr) return;
+  if (axis->stepper == nullptr) {
     sendJson(503, "{\"error\":\"Motor pulse engine is unavailable\"}");
     return;
   }
-  if (stepper->isRunning()) {
-    Serial.println("ERROR: zero requested while motor is moving");
+  if (axis->stepper->isRunning()) {
     sendJson(409, "{\"error\":\"Stop the motor before zeroing\"}");
     return;
   }
-  stepper->setCurrentPosition(0);
-  Serial.println("Zero position command: current position set to 0");
+  axis->stepper->setCurrentPosition(0);
+  Serial.printf("Zero %s position command\n", axis->name);
   sendJson(200, "{\"message\":\"Position zeroed\"}");
 }
 
-/** POST /settings: validate/store distance, speed, and acceleration values. */
+/** POST /settings: validate and store settings for one selected axis. */
 void handleSettings() {
-  if (!applySettingsFromRequest(true)) return;
-  Serial.printf("Settings applied; move distance: %ld steps\n", requestedSteps);
+  AxisState *axis = axisFromRequest();
+  if (axis == nullptr) return;
+  if (!applySettingsFromRequest(*axis, true)) return;
+  Serial.printf("%s settings applied; distance: %ld steps\n",
+                axis->name, axis->requestedSteps);
   sendJson(200, "{\"message\":\"Settings applied\"}");
 }
 
@@ -364,6 +471,44 @@ void handleSettings() {
 void handleNotFound() {
   Serial.printf("ERROR: HTTP 404 for %s\n", server.uri().c_str());
   sendJson(404, "{\"error\":\"Not found\"}");
+}
+
+/**
+ * Hard-limit ISRs stop only the affected manual-test axis. forceStop() is
+ * documented by FastAccelStepper as interrupt-safe and prevents a web request
+ * from delaying limit response. Future coordinated CNC motion should stop all
+ * axes and invalidate machine position; FluidNC supplies that behavior.
+ */
+void IRAM_ATTR handleXLimitInterrupt() {
+  axisX.limitEventPending = true;
+  if (axisX.stepper != nullptr) axisX.stepper->forceStop();
+}
+
+void IRAM_ATTR handleYLimitInterrupt() {
+  axisY.limitEventPending = true;
+  if (axisY.stepper != nullptr) axisY.stepper->forceStop();
+}
+
+/** Allocate and configure one MCPWM/PCNT-backed FastAccelStepper axis. */
+bool configureAxis(AxisState &axis) {
+  axis.stepper = stepperEngine.stepperConnectToPin(axis.stepPin, DRIVER_MCPWM_PCNT);
+  if (axis.stepper == nullptr) {
+    Serial.printf("ERROR: could not allocate %s STEP pin GPIO %u\n",
+                  axis.name, axis.stepPin);
+    return false;
+  }
+  axis.stepper->setDirectionPin(axis.directionPin, axis.directionHighCountsUp);
+  axis.stepper->setEnablePin(axis.enablePin, true);  // true = active LOW
+  axis.stepper->setAutoEnable(false);                // Retain holding torque.
+  if (axis.stepper->setSpeedInHz(static_cast<uint32_t>(axis.configuredMaxSpeed)) != 0 ||
+      axis.stepper->setAcceleration(static_cast<int32_t>(axis.configuredAcceleration)) != 0) {
+    Serial.printf("ERROR: invalid default motion settings for %s\n", axis.name);
+    return false;
+  }
+  Serial.printf("%s axis ready: STEP %u, DIR %u, ENABLE %u, LIMIT %u\n",
+                axis.name, axis.stepPin, axis.directionPin,
+                axis.enablePin, axis.limitPin);
+  return true;
 }
 
 // -------------------- Future homing placeholder --------------------
@@ -374,12 +519,12 @@ void handleNotFound() {
  * function. That preserves STOP and HTTP responsiveness during homing.
  */
 void homeStepper() {
-  // Future sequence (do not call automatically):
-  // 1. Start a non-blocking move toward HOME_SWITCH_PIN.
-  // 2. Detect the switch and stop with FastAccelStepper.
-  // 3. Back away until the switch releases.
-  // 4. Approach the switch again slowly for repeatability.
-  // 5. Stop and call stepper->setCurrentPosition(0).
+  // Future sequence for each X_LIMIT_PIN/Y_LIMIT_PIN (do not call automatically):
+  // 1. Start a non-blocking negative move toward the axis switch.
+  // 2. Detect the switch and stop that FastAccelStepper axis.
+  // 3. Back away in the positive direction until the switch closes.
+  // 4. Approach slowly for a repeatable second touch.
+  // 5. Stop and call that axis's setCurrentPosition(0).
   // Implement this later as a non-blocking state machine so HTTP stays responsive.
 }
 
@@ -400,29 +545,33 @@ void setup() {
   Serial.println();
   Serial.println("ESP32 stepper controller starting");
 
-  // Start safely: hold the active-LOW enable HIGH before configuring motion.
-  pinMode(ENABLE_PIN, OUTPUT);
-  digitalWrite(ENABLE_PIN, HIGH);
+  // Start safely: hold both active-LOW enable outputs HIGH before motion setup.
+  pinMode(X_ENABLE_PIN, OUTPUT);
+  pinMode(Y_ENABLE_PIN, OUTPUT);
+  digitalWrite(X_ENABLE_PIN, HIGH);
+  digitalWrite(Y_ENABLE_PIN, HIGH);
+
+  // NO-to-GND switches read HIGH while released and LOW while pressed. GPIO 32
+  // and GPIO 13 both provide the internal pull-ups required by this wiring.
+  pinMode(X_LIMIT_PIN, INPUT_PULLUP);
+  pinMode(Y_LIMIT_PIN, INPUT_PULLUP);
 
   // FastAccelStepper uses ESP32 hardware peripherals and a queued ramp engine,
   // so pulse timing does not depend on web-server or Wi-Fi work in loop().
   stepperEngine.init();
-  // Explicitly use ESP32 MCPWM for pulse timing and PCNT for position tracking.
-  stepper = stepperEngine.stepperConnectToPin(STEP_PIN, DRIVER_MCPWM_PCNT);
-  if (stepper != nullptr) {
-    stepper->setDirectionPin(DIR_PIN);
-    stepper->setEnablePin(ENABLE_PIN, true);  // true = active LOW
-    stepper->setAutoEnable(false);            // Keep holding torque when stopped.
-    stepper->setSpeedInHz(static_cast<uint32_t>(configuredMaxSpeed));
-    stepper->setAcceleration(static_cast<int32_t>(configuredAcceleration));
-    Serial.println("FastAccelStepper MCPWM/PCNT pulse engine initialized");
-  } else {
-    Serial.println("ERROR: FastAccelStepper could not allocate STEP_PIN");
-  }
+  const bool xReady = configureAxis(axisX);
+  const bool yReady = configureAxis(axisY);
+  // NO switches transition HIGH -> LOW when pressed.
+  attachInterrupt(digitalPinToInterrupt(X_LIMIT_PIN), handleXLimitInterrupt, FALLING);
+  attachInterrupt(digitalPinToInterrupt(Y_LIMIT_PIN), handleYLimitInterrupt, FALLING);
+  Serial.println("FastAccelStepper MCPWM/PCNT engines initialized");
   // No movement is commanded at boot.
 
   // Wi-Fi connection.
   WiFi.mode(WIFI_AP_STA);
+  // This controller has continuous external power. Disabling station power
+  // saving trades a little consumption for substantially lower HTTP latency.
+  WiFi.setSleep(false);
   WiFi.onEvent(handleWiFiEvent);
 
   // Keep a direct phone-to-ESP32 network available even if the home Wi-Fi is
@@ -438,9 +587,14 @@ void setup() {
   Serial.println("Scanning for nearby Wi-Fi networks...");
   const int networkCount = WiFi.scanNetworks();
   bool configuredNetworkSeen = false;
-  bool preferredAccessPointFound = false;
-  int32_t preferredChannel = 0;
-  uint8_t preferredBssid[6] = {};
+  bool strongestAccessPointFound = false;
+  int strongestRssi = INT_MIN;
+  int32_t strongestChannel = 0;
+  uint8_t strongestBssid[6] = {};
+  bool wpa2FallbackFound = false;
+  int wpa2FallbackRssi = INT_MIN;
+  int32_t wpa2FallbackChannel = 0;
+  uint8_t wpa2FallbackBssid[6] = {};
   for (int i = 0; i < networkCount; ++i) {
     if (WiFi.SSID(i) == WIFI_SSID) {
       configuredNetworkSeen = true;
@@ -448,13 +602,21 @@ void setup() {
                     WIFI_SSID, WiFi.BSSIDstr(i).c_str(), WiFi.RSSI(i),
                     WiFi.channel(i), WiFi.encryptionType(i));
 
-      // This network has both WPA2-only and WPA2/WPA3 radios with the same SSID.
-      // Prefer WPA2-only because this ESP32 repeatedly fails authentication on
-      // the mixed-security radio even though the password is correct.
-      if (!preferredAccessPointFound && WiFi.encryptionType(i) == WIFI_AUTH_WPA2_PSK) {
-        preferredAccessPointFound = true;
-        preferredChannel = WiFi.channel(i);
-        memcpy(preferredBssid, WiFi.BSSID(i), sizeof(preferredBssid));
+      // Prefer the strongest radio regardless of whether it advertises WPA2 or
+      // WPA2/WPA3 transition mode. Retain the strongest WPA2-only radio as a
+      // compatibility fallback in case the mixed-security association fails.
+      if (!strongestAccessPointFound || WiFi.RSSI(i) > strongestRssi) {
+        strongestAccessPointFound = true;
+        strongestRssi = WiFi.RSSI(i);
+        strongestChannel = WiFi.channel(i);
+        memcpy(strongestBssid, WiFi.BSSID(i), sizeof(strongestBssid));
+      }
+      if (WiFi.encryptionType(i) == WIFI_AUTH_WPA2_PSK &&
+          (!wpa2FallbackFound || WiFi.RSSI(i) > wpa2FallbackRssi)) {
+        wpa2FallbackFound = true;
+        wpa2FallbackRssi = WiFi.RSSI(i);
+        wpa2FallbackChannel = WiFi.channel(i);
+        memcpy(wpa2FallbackBssid, WiFi.BSSID(i), sizeof(wpa2FallbackBssid));
       }
     }
   }
@@ -463,20 +625,41 @@ void setup() {
   }
   WiFi.scanDelete();
 
-  if (preferredAccessPointFound) {
-    Serial.printf("Connecting through WPA2 access point %02X:%02X:%02X:%02X:%02X:%02X on channel %ld\n",
-                  preferredBssid[0], preferredBssid[1], preferredBssid[2],
-                  preferredBssid[3], preferredBssid[4], preferredBssid[5],
-                  static_cast<long>(preferredChannel));
-    WiFi.begin(WIFI_SSID, WIFI_PASSWORD, preferredChannel, preferredBssid, true);
+  if (strongestAccessPointFound) {
+    Serial.printf("Connecting through strongest access point %02X:%02X:%02X:%02X:%02X:%02X at %d dBm on channel %ld\n",
+                  strongestBssid[0], strongestBssid[1], strongestBssid[2],
+                  strongestBssid[3], strongestBssid[4], strongestBssid[5],
+                  strongestRssi, static_cast<long>(strongestChannel));
+    WiFi.begin(WIFI_SSID, WIFI_PASSWORD, strongestChannel, strongestBssid, true);
   } else {
     WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
   }
   Serial.printf("Connecting to Wi-Fi SSID: %s", WIFI_SSID);
   const unsigned long wifiStartTime = millis();
-  while (WiFi.status() != WL_CONNECTED && millis() - wifiStartTime < 20000UL) {
+  while (WiFi.status() != WL_CONNECTED && millis() - wifiStartTime < 12000UL) {
     delay(500);  // Startup-only wait; no motor command exists yet.
     Serial.print('.');
+  }
+
+  // Some older ESP32 Wi-Fi stacks cannot associate with certain WPA2/WPA3
+  // transition-mode radios. Retry the strongest WPA2-only BSSID when it is a
+  // different radio; the direct ESP32 AP remains available throughout.
+  if (WiFi.status() != WL_CONNECTED && wpa2FallbackFound &&
+      memcmp(strongestBssid, wpa2FallbackBssid, sizeof(strongestBssid)) != 0) {
+    Serial.printf("\nStrongest radio failed; retrying WPA2 fallback %02X:%02X:%02X:%02X:%02X:%02X at %d dBm\n",
+                  wpa2FallbackBssid[0], wpa2FallbackBssid[1],
+                  wpa2FallbackBssid[2], wpa2FallbackBssid[3],
+                  wpa2FallbackBssid[4], wpa2FallbackBssid[5], wpa2FallbackRssi);
+    WiFi.disconnect(false, false);
+    delay(250);
+    WiFi.begin(WIFI_SSID, WIFI_PASSWORD, wpa2FallbackChannel,
+               wpa2FallbackBssid, true);
+    const unsigned long fallbackStartTime = millis();
+    while (WiFi.status() != WL_CONNECTED &&
+           millis() - fallbackStartTime < 12000UL) {
+      delay(500);  // Startup-only retry; motion is still disabled.
+      Serial.print('.');
+    }
   }
   Serial.println();
   if (WiFi.status() == WL_CONNECTED) {
@@ -488,6 +671,7 @@ void setup() {
 
   // HTTP routes.
   server.on("/", HTTP_GET, []() { server.send_P(200, "text/html", INDEX_HTML); });
+  server.on("/favicon.ico", HTTP_GET, []() { server.send(204); });
   server.on("/status", HTTP_GET, handleStatus);
   server.on("/move", HTTP_POST, handleMove);
   server.on("/stop", HTTP_POST, handleStop);
@@ -497,13 +681,12 @@ void setup() {
   server.begin();
   Serial.println("HTTP server started");
 
-  // Enable the active-LOW motor driver only after initialization is complete.
-  if (stepper != nullptr && stepper->enableOutputs()) {
-    Serial.println("Motor driver enabled; no movement commanded");
-  } else {
-    digitalWrite(ENABLE_PIN, HIGH);
-    Serial.println("ERROR: motor driver remains disabled");
-  }
+  // Enable each active-LOW driver only if its complete axis setup succeeded.
+  if (xReady && axisX.stepper->enableOutputs()) Serial.println("X driver enabled");
+  else digitalWrite(X_ENABLE_PIN, HIGH);
+  if (yReady && axisY.stepper->enableOutputs()) Serial.println("Y driver enabled");
+  else digitalWrite(Y_ENABLE_PIN, HIGH);
+  Serial.println("No movement commanded at boot");
 }
 
 /**
@@ -511,6 +694,17 @@ void setup() {
  * MCPWM/PCNT engine and background queue task continue independently.
  */
 void loop() {
+  // ISRs perform the time-critical stop; logging is deferred here because
+  // Serial is not safe inside an interrupt handler.
+  if (axisX.limitEventPending) {
+    axisX.limitEventPending = false;
+    Serial.println("X LIMIT PRESSED: X motion force-stopped");
+  }
+  if (axisY.limitEventPending) {
+    axisY.limitEventPending = false;
+    Serial.println("Y LIMIT PRESSED: Y motion force-stopped");
+  }
+
   // FastAccelStepper generates queued pulses independently using ESP32 hardware.
   // The application loop only needs to keep the web server responsive.
   server.handleClient();

@@ -1,0 +1,117 @@
+# FluidNC configuration for the two-axis GT2 belt stage.
+#
+# Hardware calibration:
+# - 1.8 degree NEMA-17 motors: 200 full steps/revolution
+# - A4988 drivers with MS1/MS2/MS3 all ON: 1/16 microstepping
+# - GT2 belt with 20-tooth pulley: 40 mm/revolution
+# - 200 * 16 / 40 = 80 steps/mm
+#
+# The measured physical travels were 96.5 mm (X) and approximately 100 mm (Y).
+# Conservative software travels of 95 and 98 mm leave mechanical margin.
+# Revalidate steps/mm, direction, and travel after any mechanical change.
+
+board: ESP32-WROOM-32 Dev Module
+name: Two Axis GT2 Belt Stage
+meta: GPIO STEP/DIR A4988 controller; calibrated 2026-09-14
+
+kinematics:
+  Cartesian:
+
+stepping:
+  engine: RMT
+  # FluidNC treats 255 as "never automatically disable." Holding torque keeps
+  # the open-loop machine coordinates valid while the controller is powered.
+  idle_ms: 255
+  pulse_us: 4
+  dir_delay_us: 1
+  disable_delay_us: 0
+
+axes:
+  # Each axis makes a coarse touch and a slow precision touch during homing.
+  homing_runs: 2
+
+  x:
+    steps_per_mm: 80.000
+    max_rate_mm_per_min: 750.000
+    acceleration_mm_per_sec2: 10.000
+    max_travel_mm: 95.000
+    soft_limits: true
+    homing:
+      # Home X first, toward its negative-end switch.
+      cycle: 1
+      allow_single_axis: true
+      positive_direction: false
+      mpos_mm: 0.000
+      feed_mm_per_min: 60.000
+      seek_mm_per_min: 300.000
+      settle_ms: 500
+      seek_scaler: 1.100
+      feed_scaler: 1.100
+    motor0:
+      # NO switch to GND. :low makes LOW active; :pu enables the pull-up.
+      limit_neg_pin: gpio.32:low:pu
+      limit_pos_pin: NO_PIN
+      limit_all_pin: NO_PIN
+      hard_limits: true
+      pulloff_mm: 3.000
+      stepstick:
+        step_pin: gpio.25
+        # :low matches the direction polarity verified with the test firmware.
+        direction_pin: gpio.26:low
+        # A4988 ENABLE is LOW to run and HIGH to disable. FluidNC's disable
+        # signal is active HIGH by default, so this pin must not use :low.
+        disable_pin: gpio.27
+        # The carrier-board DIP switches set all three pins HIGH for 1/16.
+        ms1_pin: NO_PIN
+        ms2_pin: NO_PIN
+        ms3_pin: NO_PIN
+        reset_pin: NO_PIN
+    motor1:
+      null_motor:
+
+  y:
+    steps_per_mm: 80.000
+    max_rate_mm_per_min: 750.000
+    acceleration_mm_per_sec2: 10.000
+    max_travel_mm: 98.000
+    soft_limits: true
+    homing:
+      # Home Y after X, toward its negative-end switch.
+      cycle: 2
+      allow_single_axis: true
+      positive_direction: false
+      mpos_mm: 0.000
+      feed_mm_per_min: 60.000
+      seek_mm_per_min: 300.000
+      settle_ms: 500
+      seek_scaler: 1.100
+      feed_scaler: 1.100
+    motor0:
+      limit_neg_pin: gpio.13:low:pu
+      limit_pos_pin: NO_PIN
+      limit_all_pin: NO_PIN
+      hard_limits: true
+      pulloff_mm: 3.000
+      stepstick:
+        step_pin: gpio.16
+        direction_pin: gpio.17:low
+        disable_pin: gpio.22
+        ms1_pin: NO_PIN
+        ms2_pin: NO_PIN
+        ms3_pin: NO_PIN
+        reset_pin: NO_PIN
+    motor1:
+      null_motor:
+
+start:
+  # Require a successful $H after each controller restart before normal moves.
+  must_home: true
+  check_limits: true
+
+control:
+  # Add a dedicated normally-closed emergency-stop input before unattended use.
+  estop_pin: NO_PIN
+  safety_door_pin: NO_PIN
+
+probe:
+  pin: NO_PIN
