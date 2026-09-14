@@ -6,8 +6,9 @@
 # - GT2 belt with 20-tooth pulley: 40 mm/revolution
 # - 200 * 16 / 40 = 80 steps/mm
 #
-# The measured physical travels were 96.5 mm (X) and approximately 100 mm (Y).
-# Conservative software travels of 95 and 98 mm leave mechanical margin.
+# Measured travel from home to the opposite mechanical end is 520 mm (X) and
+# 460 mm (Y). Conservative 510 mm and 450 mm software travels leave 10 mm of
+# margin before the far-end mechanical stops.
 # Revalidate steps/mm, direction, and travel after any mechanical change.
 
 board: ESP32-WROOM-32 Dev Module
@@ -34,7 +35,7 @@ axes:
     steps_per_mm: 80.000
     max_rate_mm_per_min: 750.000
     acceleration_mm_per_sec2: 10.000
-    max_travel_mm: 95.000
+    max_travel_mm: 510.000
     soft_limits: true
     homing:
       # Home X first, toward its negative-end switch.
@@ -47,7 +48,7 @@ axes:
       settle_ms: 500
       # Commissioning from the far end showed that 110% stopped a few
       # millimeters before the physical switch. 125% provides search margin;
-      # it does not expand the 95 mm soft-limited working envelope.
+      # it does not expand the 510 mm soft-limited working envelope.
       seek_scaler: 1.250
       feed_scaler: 1.100
     motor0:
@@ -78,7 +79,7 @@ axes:
     steps_per_mm: 80.000
     max_rate_mm_per_min: 750.000
     acceleration_mm_per_sec2: 10.000
-    max_travel_mm: 98.000
+    max_travel_mm: 450.000
     soft_limits: true
     homing:
       # Home Y after X, toward its negative-end switch.
@@ -90,7 +91,7 @@ axes:
       seek_mm_per_min: 300.000
       settle_ms: 500
       # Match the extra search margin proven during X commissioning. This only
-      # extends the homing search and does not change the 98 mm soft limit.
+      # extends the homing search and does not change the 450 mm soft limit.
       seek_scaler: 1.250
       feed_scaler: 1.100
     motor0:

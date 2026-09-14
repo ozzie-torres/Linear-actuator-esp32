@@ -23,6 +23,8 @@ limit inputs have been electrically and mechanically verified, negative machine
 motion travels toward the minimum/home switches, and FluidNC's complete `$H`
 cycle succeeds in X-then-Y order. A final coordinate test moved X and Y from
 machine zero to 5.000 mm and returned both to 0.000 mm with the controller Idle.
+The WebUI then uploaded `gcode/first_motion_test.gcode` to LocalFS; FluidNC ran
+it through `$LocalFS/Run`, reported `Program End`, and returned to Idle at X0/Y0.
 
 The A4988 MS1/MS2/MS3 DIP switches are now all ON for 1/16 microstepping. Each
 axis uses a 1.8-degree, 200-step/revolution NEMA-17, a GT2 belt, and a 20-tooth
@@ -33,9 +35,11 @@ pulley. Therefore:
 1 microstep = 0.0125 mm commanded resolution
 ```
 
-Measured physical travel is 96.5 mm on X and approximately 100 mm on Y. The
-FluidNC file intentionally uses smaller 95 mm and 98 mm software travels to keep
-margin away from the positive mechanical ends.
+Measured travel from the home position to the opposite mechanical end is 520 mm
+on X and 460 mm on Y. FluidNC intentionally uses smaller 510 mm and 450 mm
+software travels, leaving 10 mm before each positive mechanical end. Earlier
+96.5 mm X and approximately 100 mm Y observations were calibration moves, not
+the full machine envelope.
 
 The official FluidNC v4.0.3 Windows bundle and current official validator are
 available locally under ignored `.tools/`. `fluidnc/config.yaml` passes the
@@ -81,8 +85,8 @@ this behavior if any motor leads, driver connections, or transmission changes.
 - MS1, MS2, and MS3 all ON: 1/16 microstepping
 - Two 1.8-degree NEMA-17 motors (200 full steps/revolution)
 - GT2 2 mm-pitch belts with 20-tooth pulleys
-- X calibration: 80 steps/mm; measured travel: 96.5 mm
-- Y calibration: 80 steps/mm; measured travel: approximately 100 mm
+- X calibration: 80 steps/mm; physical travel: 520 mm; soft travel: 510 mm
+- Y calibration: 80 steps/mm; physical travel: 460 mm; soft travel: 450 mm
 
 ## Build and configuration
 
@@ -192,9 +196,9 @@ configuration uses:
 - 10 mm/s^2 initial acceleration
 - X then Y sequential two-pass homing
 - 300 mm/min seek, 60 mm/min precision approach, and 3 mm pull-off
-- 125% homing search distance on each axis; 110% stopped X a few millimeters
-  short when commissioning began near the far end. This does not expand the
-  95/98 mm soft-limited working envelopes.
+- 125% homing search distance on each axis. This does not expand the 510/450 mm
+  soft-limited working envelopes; it only ensures homing can find a switch from
+  anywhere inside the measured physical travel.
 - Active-low inputs with internal pull-ups (`gpio.32:low:pu` and
   `gpio.13:low:pu`)
 - A4988 active-high disable semantics on GPIO 27 and GPIO 22
@@ -217,6 +221,10 @@ The 2026-09-14 commissioning record is:
 7. Final status was `Idle|MPos:0.000,0.000,0.000` with no active limit pins.
 8. `G91 G1 X5 F300`, followed by `G1 Y5 F300`, produced machine position
    X5.000/Y5.000. `G90 G0 X0 Y0` returned both axes to machine zero.
+9. Uploaded `gcode/first_motion_test.gcode` through the WebUI Local Filesystem
+   panel. `$LocalFS/Show` verified its contents, and
+   `$LocalFS/Run=first_motion_test.gcode` traced the 10 mm square, reported
+   `Program End`, and finished Idle at machine X0/Y0 without an alarm.
 
 Before the first real process, measure commanded travel accurately, refine
 steps/mm if necessary, dry-run a small G-code file unloaded, and add a physical
