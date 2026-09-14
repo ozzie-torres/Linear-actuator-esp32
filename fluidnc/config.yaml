@@ -45,7 +45,10 @@ axes:
       feed_mm_per_min: 60.000
       seek_mm_per_min: 300.000
       settle_ms: 500
-      seek_scaler: 1.100
+      # Commissioning from the far end showed that 110% stopped a few
+      # millimeters before the physical switch. 125% provides search margin;
+      # it does not expand the 95 mm soft-limited working envelope.
+      seek_scaler: 1.250
       feed_scaler: 1.100
     motor0:
       # NO switch to GND. :low makes LOW active; :pu enables the pull-up.
@@ -56,8 +59,10 @@ axes:
       pulloff_mm: 3.000
       stepstick:
         step_pin: gpio.25
-        # :low matches the direction polarity verified with the test firmware.
-        direction_pin: gpio.26:low
+        # FluidNC commissioning showed that the inverted polarity moved X away
+        # from its negative home switch. The plain pin makes negative machine
+        # motion travel toward the X home switch on this assembled mechanism.
+        direction_pin: gpio.26
         # A4988 ENABLE is LOW to run and HIGH to disable. FluidNC's disable
         # signal is active HIGH by default, so this pin must not use :low.
         disable_pin: gpio.27
@@ -84,7 +89,9 @@ axes:
       feed_mm_per_min: 60.000
       seek_mm_per_min: 300.000
       settle_ms: 500
-      seek_scaler: 1.100
+      # Match the extra search margin proven during X commissioning. This only
+      # extends the homing search and does not change the 98 mm soft limit.
+      seek_scaler: 1.250
       feed_scaler: 1.100
     motor0:
       limit_neg_pin: gpio.13:low:pu
@@ -94,7 +101,9 @@ axes:
       pulloff_mm: 3.000
       stepstick:
         step_pin: gpio.16
-        direction_pin: gpio.17:low
+        # The two axes use matching A4988 direction wiring. Plain polarity made
+        # negative X motion travel toward home, so Y uses the same convention.
+        direction_pin: gpio.17
         disable_pin: gpio.22
         ms1_pin: NO_PIN
         ms2_pin: NO_PIN

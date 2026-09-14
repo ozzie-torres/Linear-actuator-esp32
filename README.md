@@ -16,11 +16,13 @@ This repository has two deliberate roles:
 
 ## Current project state and handoff
 
-As of 2026-09-14, the two-axis diagnostic firmware has been built, flashed, and
-tested on the physical machine. Both axes move reliably, both limit inputs have
-been electrically and mechanically verified, negative coordinate motion has
-been calibrated to travel toward the minimum/home switches, and a supervised
-two-pass homing sequence has succeeded on both axes.
+As of 2026-09-14, the hardware has completed both diagnostic-firmware bring-up
+and FluidNC commissioning. Official FluidNC v4.0.3, its WebUI filesystem, and
+`fluidnc/config.yaml` are installed on the ESP32. Both axes move reliably, both
+limit inputs have been electrically and mechanically verified, negative machine
+motion travels toward the minimum/home switches, and FluidNC's complete `$H`
+cycle succeeds in X-then-Y order. A final coordinate test moved X and Y from
+machine zero to 5.000 mm and returned both to 0.000 mm with the controller Idle.
 
 The A4988 MS1/MS2/MS3 DIP switches are now all ON for 1/16 microstepping. Each
 axis uses a 1.8-degree, 200-step/revolution NEMA-17, a GT2 belt, and a 20-tooth
@@ -35,11 +37,13 @@ Measured physical travel is 96.5 mm on X and approximately 100 mm on Y. The
 FluidNC file intentionally uses smaller 95 mm and 98 mm software travels to keep
 margin away from the positive mechanical ends.
 
-FluidNC **has not been flashed yet**. The official FluidNC v4.0.3 Windows bundle
-and current official validator were downloaded locally under ignored `.tools/`.
-`fluidnc/config.yaml` passes the official strict validator. The next operator
-must turn off the 12-24 V motor supply before replacing firmware; see
-"FluidNC commissioning" below.
+The official FluidNC v4.0.3 Windows bundle and current official validator are
+available locally under ignored `.tools/`. `fluidnc/config.yaml` passes the
+official validator and is the configuration currently running on the machine.
+FluidNC station credentials are stored in ESP32 nonvolatile settings rather
+than this repository. At commissioning time it joined the local network at
+`http://10.0.0.68/` and advertised `http://fluidnc-stage.local/`; DHCP may assign
+a different numeric address later.
 
 ## Hardware
 
@@ -66,9 +70,10 @@ motion so the operator can back away. NO wiring is minimal but not fail-safe: a
 broken wire looks like an unpressed switch. GPIO 18/19/23/5 are deliberately
 reserved for a future VSPI SD card.
 
-Both direction-pin mappings were bench-calibrated so negative coordinate motion
-travels toward the corresponding minimum/home switch. Revalidate this behavior
-if any motor leads, driver connections, or mechanical transmission change.
+Both FluidNC direction pins use plain polarity (`gpio.26` and `gpio.17`). During
+commissioning, the earlier inverted X setting moved away from home; removing
+`:low` made negative coordinate motion travel toward each switch. Revalidate
+this behavior if any motor leads, driver connections, or transmission changes.
 
 ### Motion hardware
 
@@ -95,7 +100,7 @@ The only external Arduino library is pinned in `platformio.ini`:
 
 - FastAccelStepper 0.31.8
 
-## Network behavior
+## Diagnostic-firmware network behavior
 
 The ESP32 starts in AP+station mode:
 
@@ -108,6 +113,12 @@ The ESP32 starts in AP+station mode:
 Wi-Fi station power saving is disabled to reduce interactive latency. The web
 page also permits only one status request at a time, preventing slow polls from
 accumulating ahead of motion commands on the synchronous ESP32 WebServer.
+
+The installed FluidNC firmware uses station-with-AP-fallback mode (`STA>AP`),
+DHCP, and hostname `fluidnc-stage`. Network credentials live in FluidNC NVS and
+are intentionally absent from Git. Use the FluidNC WebUI, USB serial, or a G-code
+sender for normal machine control; the custom HTTP API below belongs only to the
+diagnostic firmware and is not served while FluidNC is installed.
 
 ## HTTP API
 
@@ -154,26 +165,25 @@ responsive.
   temperature must be monitored.
 - There is currently no dedicated hardware emergency-stop input.
 
-## Planned CNC/G-code transition
+## CNC/G-code controller
 
-This custom firmware is intentionally a two-axis electrical and mechanical
-bring-up tool; it does not coordinate axes or interpret G-code. Once both axes,
-directions, steps-per-distance, and limit switches are validated, migrate the
-same pin map to FluidNC. FluidNC provides coordinated interpolation, machine and
-work coordinates, homing cycles, hard/soft limits, WebUI control, and execution
-of uploaded or SD-card G-code without maintaining a custom motion planner.
+The custom firmware remains an electrical and mechanical diagnostic tool; it
+does not coordinate axes or interpret G-code. The machine has now migrated to
+FluidNC, which provides coordinated interpolation, machine/work coordinates,
+homing, hard/soft limits, WebUI control, and execution of uploaded or SD-card
+G-code without maintaining a custom motion planner.
 
 The validated migration configuration is in `fluidnc/config.yaml`. It records
 the A4988 1/16 microstep setting, 20-tooth GT2 calibration (80 steps/mm),
-calibrated direction polarity, conservative travel limits, and sequential X/Y
-homing. Keep this diagnostic firmware available until FluidNC commissioning is
-complete; flashing FluidNC replaces the application currently on the ESP32.
+commissioned direction polarity, conservative travel limits, and sequential X/Y
+homing. Keep the diagnostic firmware in Git for future electrical troubleshooting;
+reflashing it would replace FluidNC on the ESP32.
 
 ## FluidNC commissioning
 
-Use official FluidNC v4.0.3 or a later version only after reviewing its release
-notes and revalidating the YAML against that version. The present configuration
-uses:
+Official FluidNC v4.0.3 was installed and tested. Review release notes and
+revalidate the YAML before upgrading to another version. The running
+configuration uses:
 
 - ESP32 RMT hardware stepping
 - Cartesian X/Y kinematics
@@ -182,30 +192,36 @@ uses:
 - 10 mm/s^2 initial acceleration
 - X then Y sequential two-pass homing
 - 300 mm/min seek, 60 mm/min precision approach, and 3 mm pull-off
+- 125% homing search distance on each axis; 110% stopped X a few millimeters
+  short when commissioning began near the far end. This does not expand the
+  95/98 mm soft-limited working envelopes.
 - Active-low inputs with internal pull-ups (`gpio.32:low:pu` and
   `gpio.13:low:pu`)
 - A4988 active-high disable semantics on GPIO 27 and GPIO 22
 - Hard limits, soft limits, and mandatory homing after restart
 
-Commission in this order:
+The 2026-09-14 commissioning record is:
 
-1. Preserve this repository and confirm `fluidnc/config.yaml` validates.
-2. Move both carriages off their switches; the last diagnostic session moved
-   both 3 mm positive and confirmed both inputs released.
-3. Turn off the 12-24 V motor supply. Leave only ESP32 USB connected.
-4. Erase the ESP32, install the official FluidNC Wi-Fi firmware and WebUI
-   filesystem, then upload `fluidnc/config.yaml` as `/config.yaml`.
-5. Inspect the complete serial startup report. Do not apply motor power if any
-   pin, parser, filesystem, or configuration error appears.
-6. With motor power still off, verify limit states and ENABLE/DIR/STEP polarity.
-7. Apply motor power, test small positive jogs, and confirm each axis moves away
-   from its negative switch.
-8. Run `$H` while supervising the machine and keeping power removal within
-   reach. Confirm X homes first, followed by Y, and both pull off cleanly.
-9. Verify millimeter motion using a small `G91 G0 X10` / `G0 Y10` test and
-   measure actual travel before enabling unattended jobs.
-10. Dry-run a small G-code file with the mechanism unloaded before running a
-    real process.
+1. Erased the ESP32 and installed the official Wi-Fi image plus WebUI filesystem.
+2. Uploaded the validated YAML as `/littlefs/config.yaml`; the complete startup
+   report parsed every assigned pin without an error.
+3. With motor power off, pressed X and Y individually and observed `Pn:X` and
+   `Pn:Y`; both cleared when released. `$MD` drove both active-low A4988 ENABLE
+   inputs to the safe 3.3 V disabled level.
+4. Initial X homing exposed reversed FluidNC direction polarity. X and Y were
+   corrected to plain `gpio.26` and `gpio.17` direction pins.
+5. X's initial 110% homing search expired a few millimeters before the switch.
+   Both axes now use 125%, providing margin for a start at the far end.
+6. `$HX` and `$HY` each completed their seek, pull-off, slow approach, and zero.
+   A subsequent full `$H` reported `Homed:X`, then `Homed:Y`.
+7. Final status was `Idle|MPos:0.000,0.000,0.000` with no active limit pins.
+8. `G91 G1 X5 F300`, followed by `G1 Y5 F300`, produced machine position
+   X5.000/Y5.000. `G90 G0 X0 Y0` returned both axes to machine zero.
+
+Before the first real process, measure commanded travel accurately, refine
+steps/mm if necessary, dry-run a small G-code file unloaded, and add a physical
+normally-closed emergency stop. Open-loop step counts do not prove that the
+mechanism moved without losing steps.
 
 The standard VSPI pins GPIO 18/19/23/5 remain unused, allowing a later SD-card
 interface. FluidNC can initially upload and run small G-code files from its
